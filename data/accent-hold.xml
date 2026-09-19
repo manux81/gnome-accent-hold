@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component>
+    <name>org.gnome.AccentHold</name>
+    <description>macOS-style accent hold for GNOME/IBus</description>
+    <exec>@ENGINE_PATH@</exec>
+    <version>0.9.0</version>
+    <author>Manuele Conti</author>
+    <license>MIT</license>
+    <homepage></homepage>
+    <textdomain>gnome-accent-hold</textdomain>
+    <engines>
+        <engine>
+            <name>accent-hold</name>
+            <longname>English (US) - Accent Hold</longname>
+            <description>US keyboard with macOS-style accent hold</description>
+            <language>en</language>
+            <license>MIT</license>
+            <author>Manuele Conti</author>
+            <layout>us</layout>
+            <rank>80</rank>
+            <symbol>AH</symbol>
+        </engine>
+    </engines>
+</component>
