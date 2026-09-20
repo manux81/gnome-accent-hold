@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Accent Hold v0.9.3-experimental
+# Accent Hold v0.9.7-experimental
 # IBus engine: immediate typing + macOS-like custom popup (numbers below letters)
 
 import gi
@@ -478,9 +478,43 @@ class AccentHoldEngine(IBus.Engine):
             self.popup.select(self.selected)
 
     def do_focus_out(self):
+        self._debug(
+            f"FOCUS OUT pending={self.pending_char!r} "
+            f"timer_id={self.timer_id} popup={self.popup_active}"
+        )
+
+        # Chromium/Electron contenteditable editors may briefly cycle the IBus
+        # input context after commit_text(). Keep an in-progress hold alive,
+        # just as we do for their spurious reset signal.
+        if (
+            (self.pending_keyval is not None and self.timer_id)
+            or self.popup_active
+        ):
+            self._debug(
+                "FOCUS OUT IGNORED while hold timer/popup is active"
+            )
+            return
+
         self.cancel_all()
 
     def do_reset(self):
+        self._debug(
+            f"RESET pending={self.pending_char!r} "
+            f"timer_id={self.timer_id} popup={self.popup_active}"
+        )
+
+        # Chromium/Electron clients may reset the IBus context immediately
+        # after accepting commit_text(). Do not let that reset cancel an
+        # in-progress long-press detection.
+        if (
+            (self.pending_keyval is not None and self.timer_id)
+            or self.popup_active
+        ):
+            self._debug(
+                "RESET IGNORED while hold timer/popup is active"
+            )
+            return
+
         self.cancel_all()
 
     def do_destroy(self):
@@ -567,8 +601,14 @@ class AccentHoldEngine(IBus.Engine):
             char = chr(char) if char else ""
 
         if char in ACCENTS:
-            # Ignore hardware/autorepeat PRESS events while the same key is held.
+            # Electron/Chromium may emit repeated PRESS events before the
+            # long-press timer fires. Keep the original timer alive and swallow
+            # those repeats so they cannot restart the timer or insert letters.
             if self.pending_keyval == keyval:
+                self._debug(
+                    f"PENDING REPEAT SWALLOWED keyval={keyval} "
+                    f"timer_id={self.timer_id}"
+                )
                 return True
 
             # If another pending key somehow exists, stop tracking it.
@@ -627,7 +667,7 @@ def main():
     factory = AccentHoldFactory(bus)
     bus.request_name(BUS_NAME, 0)
 
-    print("Accent Hold v0.9.3-experimental ready", flush=True)
+    print("Accent Hold v0.9.7-experimental ready", flush=True)
     GLib.MainLoop().run()
 
 
