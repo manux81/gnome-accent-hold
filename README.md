@@ -4,7 +4,13 @@
 
 GNOME Accent Hold adds a simple way to type accented and alternate Latin characters while keeping a US keyboard layout. Tap a key normally and it behaves exactly like a regular US keyboard. Hold a supported letter and a compact character menu appears next to the text cursor.
 
-![GNOME Accent Hold character picker](assets/accent-popup.png)
+<p align="center">
+  <img src="assets/accent-hold-demo.gif"
+       alt="GNOME Accent Hold: hold a key and select an accented character"
+       width="900">
+</p>
+
+<p align="center"><em>Hold a letter, then choose an accented character with a number or the arrow keys.</em></p>
 
 ## Type accented characters by holding a key
 
@@ -90,13 +96,14 @@ chmod +x install.sh uninstall.sh
 ./install.sh
 ```
 
-The installer places the user-level files under:
+The installer places the engine in your user account and registers the IBus component system-wide:
 
 ```text
-~/.local/libexec/gnome-accent-hold/
-~/.local/share/ibus/component/
-~/.config/autostart/
+~/.local/libexec/gnome-accent-hold/engine.py
+/usr/share/ibus/component/accent-hold.xml
 ```
+
+Installing the IBus component requires `sudo`. After installation, log out and back in (or restart IBus), then select **English (US) - Accent Hold** from GNOME's input sources.
 
 Check the active IBus engine with:
 
@@ -109,6 +116,12 @@ When active, it should print:
 ```text
 accent-hold
 ```
+
+## Application compatibility
+
+GNOME Accent Hold uses the IBus input-method interface rather than application-specific key bindings. It has been designed to work across regular GTK applications and has also been tested with Chromium/Electron-style text fields and editors.
+
+Because Linux applications can implement input methods differently, please report application-specific issues with the application name, desktop session (X11/Wayland), and IBus version.
 
 ## Uninstall
 
@@ -127,6 +140,7 @@ gnome-accent-hold/
 ├── data/
 │   └── accent-hold.xml
 ├── assets/
+│   ├── accent-hold-demo.gif
 │   └── accent-popup.png
 ├── install.sh
 ├── uninstall.sh
