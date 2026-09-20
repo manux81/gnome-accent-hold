@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Accent Hold v0.7
+# Accent Hold v0.9.3-experimental
 # IBus engine: immediate typing + macOS-like custom popup (numbers below letters)
 
 import gi
@@ -344,8 +344,12 @@ class AccentHoldEngine(IBus.Engine):
         self._debug("ENGINE CREATED")
 
     def _debug(self, message):
-        # Diagnostics disabled in release builds.
-        pass
+        try:
+            with open("/tmp/accent-hold.log", "a", encoding="utf-8") as f:
+                f.write(f"{GLib.get_monotonic_time()} {message}\n")
+                f.flush()
+        except Exception:
+            pass
 
     def do_set_cursor_location(self, x, y, w, h):
         self._debug(f"CURSOR x={x} y={y} w={w} h={h}")
@@ -383,14 +387,40 @@ class AccentHoldEngine(IBus.Engine):
         self.commit_text(IBus.Text.new_from_string(text))
 
     def replace_immediate_char(self, replacement):
-        # The original character was already committed on key PRESS.
-        # Some clients (notably terminals) do not implement
-        # delete_surrounding_text() reliably. Forward a synthetic BackSpace
-        # through IBus, then commit the selected accented character.
-        self._debug(f"REPLACE via BackSpace replacement={replacement!r}")
+        # v0.9.3 experimental replacement:
+        # Prefer IBus surrounding-text deletion when the client exposes
+        # useful surrounding text. Fall back to the known-good synthetic
+        # BackSpace path for clients such as terminals.
+        self._debug(f"REPLACE BEGIN replacement={replacement!r}")
+
+        try:
+            result = self.get_surrounding_text()
+            self._debug(f"SURROUNDING raw={result!r}")
+
+            if result is not None:
+                text, cursor_pos, anchor_pos = result
+                value = text.get_text() if text is not None else ""
+
+                self._debug(
+                    f"SURROUNDING text={value!r} "
+                    f"cursor={cursor_pos} anchor={anchor_pos}"
+                )
+
+                if value and cursor_pos > 0:
+                    self._debug("REPLACE ACTION delete_surrounding_text(-1, 1)")
+                    self.delete_surrounding_text(-1, 1)
+                    self._debug(f"REPLACE ACTION commit({replacement!r})")
+                    self.commit(replacement)
+                    self._debug("REPLACE END via surrounding-text")
+                    return
+
+        except Exception as exc:
+            self._debug(f"SURROUNDING/DELETE ERROR {exc!r}")
+
+        self._debug("REPLACE ACTION fallback BackSpace")
         self.forward_key_event(
             IBus.KEY_BackSpace,
-            14,  # conventional X11 hardware keycode for BackSpace
+            14,
             0,
         )
         self.forward_key_event(
@@ -398,7 +428,9 @@ class AccentHoldEngine(IBus.Engine):
             14,
             IBus.ModifierType.RELEASE_MASK,
         )
+        self._debug(f"REPLACE ACTION commit({replacement!r})")
         self.commit(replacement)
+        self._debug("REPLACE END via BackSpace")
 
     def ensure_popup(self):
         if self.popup is None:
@@ -595,7 +627,7 @@ def main():
     factory = AccentHoldFactory(bus)
     bus.request_name(BUS_NAME, 0)
 
-    print("Accent Hold v0.9.0 ready", flush=True)
+    print("Accent Hold v0.9.3-experimental ready", flush=True)
     GLib.MainLoop().run()
 
 
