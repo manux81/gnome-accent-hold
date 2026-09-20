@@ -90,7 +90,7 @@ sudo apt install ibus python3-gi gir1.2-gtk-3.0 python3-cairo
 Clone the repository and run the installer:
 
 ```bash
-git clone <YOUR-GITHUB-REPOSITORY-URL>
+git clone https://github.com/manux81/gnome-accent-hold
 cd gnome-accent-hold
 chmod +x install.sh uninstall.sh
 ./install.sh
