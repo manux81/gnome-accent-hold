@@ -61,8 +61,8 @@ It is particularly useful if you normally type with a US keyboard but regularly 
 - Escape to cancel
 - Uppercase accented characters with Shift
 - Ctrl, Alt and Super shortcuts pass through normally
-- Popup anchored to the text cursor
-- Multi-monitor/scaling-aware positioning on X11
+- Native IBus candidate panel anchored to the text cursor
+- Wayland and X11 support without a focus-stealing or tileable application window
 - Lightweight IBus input method
 - Automatic activation after GNOME login
 
@@ -73,17 +73,18 @@ The current release is developed and tested with:
 - GNOME
 - IBus
 - Python 3
-- PyGObject / GTK 3
-- Pycairo
-- X11
+- PyGObject with IBus introspection data
+- A GNOME Wayland or X11 session
 
 On Ubuntu/Debian, the required packages are typically available with:
 
 ```bash
-sudo apt install ibus python3-gi gir1.2-gtk-3.0 python3-cairo
+sudo apt install ibus python3-gi gir1.2-ibus-1.0
 ```
 
-> **Wayland:** the current popup positioning implementation has been developed and tested on X11. Wayland support is a planned area of work.
+The candidate UI is rendered by the IBus panel. On Wayland this keeps it out
+of the compositor's normal application-window and tiling lifecycle; on X11 the
+same IBus path is used for consistent behavior.
 
 ## Install
 
@@ -123,7 +124,17 @@ accent-hold
 
 GNOME Accent Hold uses the IBus input-method interface rather than application-specific key bindings. It has been designed to work across regular GTK applications and has also been tested with Chromium/Electron-style text fields and editors.
 
+Normal keystrokes are forwarded to the application for native insertion and are only observed for hold detection, so surfaces that bypass IME commits (browser canvases, web-based server/serial consoles, remote-desktop views) still receive every character. Only the candidate-selection keys are consumed while the hold menu is visible.
+
 Because Linux applications can implement input methods differently, please report application-specific issues with the application name, desktop session (X11/Wayland), and IBus version.
+
+## Diagnostics
+
+The engine records key flow, focus/reset events, lookup-table actions, candidate
+clicks, and commits in `/tmp/accent-hold.log`. Set `ACCENT_HOLD_LOG` in the
+engine environment to use a different path. Each key record includes its
+keyval, hardware keycode, modifier mask, press/release state, popup state,
+pending character, and selected candidate.
 
 ## Uninstall
 
