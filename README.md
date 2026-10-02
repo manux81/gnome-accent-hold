@@ -96,14 +96,16 @@ chmod +x install.sh uninstall.sh
 ./install.sh
 ```
 
-The installer places the engine in your user account and registers the IBus component system-wide:
+The installer places both the engine and its IBus component in your user account:
 
 ```text
 ~/.local/libexec/gnome-accent-hold/engine.py
-/usr/share/ibus/component/accent-hold.xml
+~/.local/share/ibus/component/accent-hold.xml
 ```
 
-Installing the IBus component requires `sudo`. After installation, log out and back in (or restart IBus), then select **English (US) - Accent Hold** from GNOME's input sources.
+No `sudo` access is required, so installation works on immutable systems such as Fedora Silverblue. The installer refreshes the per-user IBus registry cache with both the user and system component paths. After installation, log out and back in (or restart IBus), then select **English (US) - Accent Hold** from GNOME's input sources.
+
+If you previously installed a version that placed the component in `/usr/share/ibus/component`, the installer will report it and print the one-time command needed to remove that legacy file.
 
 Check the active IBus engine with:
 
