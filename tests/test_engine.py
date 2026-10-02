@@ -136,6 +136,13 @@ class FakeIBus(types.ModuleType):
     KEY_space = ord(" ")
     KEY_Escape = 0xFF1B
     KEY_BackSpace = 0xFF08
+    KEY_Shift_L = 0xFFE1
+    KEY_Shift_R = 0xFFE2
+    KEY_Control_L = 0xFFE3
+    KEY_Control_R = 0xFFE4
+    KEY_Alt_L = 0xFFE9
+    KEY_Super_L = 0xFFEB
+    KEY_Caps_Lock = 0xFFE5
 
     @staticmethod
     def keyval_to_unicode(keyval):
@@ -149,16 +156,24 @@ class FakeIBus(types.ModuleType):
 class FakeGLib(types.ModuleType):
     SOURCE_REMOVE = False
     next_timer = 1
+    pending = {}
 
     @classmethod
-    def timeout_add(cls, _milliseconds, _callback):
+    def timeout_add(cls, milliseconds, callback, *args):
         timer = cls.next_timer
         cls.next_timer += 1
+        cls.pending[timer] = (milliseconds, callback, args)
         return timer
 
-    @staticmethod
-    def source_remove(_timer):
+    @classmethod
+    def source_remove(cls, timer):
+        cls.pending.pop(timer, None)
         return True
+
+    @classmethod
+    def fire(cls, timer):
+        _milliseconds, callback, args = cls.pending.pop(timer)
+        return callback(*args)
 
 
 gi = types.ModuleType("gi")
@@ -221,6 +236,7 @@ class EngineTest(unittest.TestCase):
         self.assertFalse(self.press(ord("a")))
         # Autorepeat while held: swallowed so the client inserts only once.
         self.assertTrue(self.press(ord("a")))
+        self.assertEqual(1, self.engine.repeat_extra)
         self.assertEqual([], self.engine.commits)
         self.assertFalse(self.release(ord("a")))
         self.assertIsNone(self.engine.pending_char)
@@ -294,16 +310,67 @@ class EngineTest(unittest.TestCase):
         self.assertFalse(self.release(ord("a")))
         self.assertEqual(["à"], self.engine.commits)
 
+    def run_commit(self):
+        timer = self.engine.commit_timer_id
+        self.assertNotEqual(0, timer, "expected a scheduled commit")
+        FakeGLib.fire(timer)
+
     def test_backspace_fallback_without_surrounding_text(self):
         self.engine._surrounding = None
         self.engine.surrounding_text = ""
         self.hold_a()
         self.assertTrue(self.press(ord("1")))
-        # Wayland-safe fallback: keycode 0 lets the client use the keyval.
+        # Wayland-safe fallback carries a real hardware keycode (evdev 14
+        # by default): keycode 0 is ignored by Wayland clients.
         self.assertIn(
-            (FakeIBus.KEY_BackSpace, 0, 0), self.engine.forwards
+            (FakeIBus.KEY_BackSpace, 14, 0), self.engine.forwards
         )
+        # The commit waits for the BackSpace round-trip (COMMIT_DELAY_MS).
+        self.assertEqual([], self.engine.commits)
+        self.run_commit()
         self.assertEqual(["à"], self.engine.commits)
+
+    def test_observed_backspace_keycode_is_reused(self):
+        self.engine._surrounding = None
+        self.engine.surrounding_text = ""
+        self.press(FakeIBus.KEY_BackSpace)
+        self.hold_a()
+        self.assertTrue(self.press(ord("1")))
+        presses = [f for f in self.engine.forwards if f[0] == FakeIBus.KEY_BackSpace]
+        self.assertTrue(presses)
+        self.assertEqual(38, presses[0][1])
+        self.assertEqual([], self.engine.commits)
+        self.run_commit()
+        self.assertEqual(["à"], self.engine.commits)
+
+    def test_empty_surrounding_query_uses_backspace_fallback(self):
+        # Even with the SURROUNDING_TEXT capability bit set, an empty query
+        # means the client may ignore deletions (observed "aà"), so the
+        # engine uses the BackSpace fallback with a real keycode.
+        self.engine._surrounding = None
+        self.engine.surrounding_text = ""
+        self.engine.do_set_capabilities(0x29)
+        self.hold_a()
+        self.assertTrue(self.press(ord("1")))
+        self.assertEqual([], self.engine.deletes)
+        self.assertIn(
+            (FakeIBus.KEY_BackSpace, 14, 0), self.engine.forwards
+        )
+        self.assertEqual([], self.engine.commits)
+        self.run_commit()
+        self.assertEqual(["à"], self.engine.commits)
+
+    def test_pending_commit_cancelled_by_cancel_all(self):
+        self.engine._surrounding = None
+        self.engine.surrounding_text = ""
+        self.hold_a()
+        self.assertTrue(self.press(ord("1")))
+        timer = self.engine.commit_timer_id
+        self.assertNotEqual(0, timer)
+        self.engine.cancel_all()
+        self.assertEqual(0, self.engine.commit_timer_id)
+        self.assertNotIn(timer, FakeGLib.pending)
+        self.assertEqual([], self.engine.commits)
 
     def test_capabilities_are_recorded(self):
         self.engine.do_set_capabilities(0x1F)
@@ -313,6 +380,191 @@ class EngineTest(unittest.TestCase):
     def test_shortcuts_pass_through(self):
         self.assertFalse(self.press(ord("c"), ModifierType.CONTROL_MASK))
         self.assertEqual([], self.engine.commits)
+
+    def test_leaked_repeats_are_deleted_on_replace(self):
+        # Wayland inserts swallowed repeats anyway: choosing must delete
+        # the initial char plus every leaked repeat (BackSpace path).
+        self.engine._surrounding = None
+        self.engine.surrounding_text = ""
+        self.hold_a()
+        self.assertTrue(self.press(ord("a")))
+        self.assertTrue(self.press(ord("a")))
+        self.assertTrue(self.press(ord("2")))
+        presses = [f for f in self.engine.forwards if f[0] == FakeIBus.KEY_BackSpace]
+        self.assertEqual(6, len(presses))
+        self.assertEqual([], self.engine.commits)
+        self.run_commit()
+        self.assertEqual(["á"], self.engine.commits)
+
+    def test_delete_path_clamped_to_reported_buffer(self):
+        # Query reports ("xa", cursor=2) but 1+2 repeats leaked: delete is
+        # clamped to the 2 chars actually present.
+        self.hold_a()
+        self.assertTrue(self.press(ord("a")))
+        self.assertTrue(self.press(ord("a")))
+        self.assertTrue(self.press(ord("2")))
+        self.assertEqual([(-2, 2)], self.engine.deletes)
+        self.assertEqual(["á"], self.engine.commits)
+
+    def test_repeat_suppressed_while_hold_armed_and_restored(self):
+        class FakeSettings:
+            repeat = True
+
+            @classmethod
+            def new(cls, _schema):
+                return cls()
+
+            def get_boolean(self, _key):
+                return FakeSettings.repeat
+
+            def set_boolean(self, _key, value):
+                FakeSettings.repeat = value
+
+            @staticmethod
+            def sync():
+                pass
+
+        class FakeGio:
+            Settings = FakeSettings
+
+        self.engine._keyboard_settings = staticmethod(
+            lambda: FakeSettings.new("org.gnome.desktop.peripherals.keyboard")
+        )
+        module.Gio = FakeGio
+        try:
+            FakeSettings.repeat = True
+            # Suppression is engine-lifetime scoped, (re)asserted on focus.
+            self.engine.do_focus_in()
+            self.assertTrue(FakeSettings.repeat is False)
+            # Ordinary keystrokes never toggle it back and forth.
+            self.assertFalse(self.press(ord("a")))
+            self.assertTrue(FakeSettings.repeat is False)
+            self.assertFalse(self.release(ord("a")))
+            self.assertTrue(FakeSettings.repeat is False)
+            # Hold path: suppression survives until engine teardown.
+            self.hold_a()
+            self.assertTrue(FakeSettings.repeat is False)
+            self.assertTrue(self.press(ord("1")))
+            self.assertEqual(["à"], self.engine.commits)
+            self.assertTrue(FakeSettings.repeat is False)
+            self.engine.do_destroy()
+            self.assertTrue(FakeSettings.repeat is True)
+        finally:
+            module.Gio = None
+            FakeSettings.repeat = True
+
+    def test_repeat_restore_is_noop_without_gio(self):
+        module.Gio = None
+        self.assertFalse(self.press(ord("a")))
+        self.assertFalse(self.engine._repeat_suppressed)
+        self.assertFalse(self.release(ord("a")))
+
+    def test_repeat_suppressed_immediately_on_press(self):
+        # Hard requirement: a held accentable key yields exactly one char,
+        # so suppression is already in place before any keystroke (asserted
+        # on focus) and keystrokes never toggle it. Writes are async.
+        class FakeSettings:
+            repeat = True
+            syncs = 0
+
+            @classmethod
+            def new(cls, _schema):
+                return cls()
+
+            def get_boolean(self, _key):
+                return FakeSettings.repeat
+
+            def set_boolean(self, _key, value):
+                FakeSettings.repeat = value
+
+            @staticmethod
+            def sync():
+                FakeSettings.syncs += 1
+
+        class FakeGio:
+            Settings = FakeSettings
+
+        self.engine._keyboard_settings = staticmethod(
+            lambda: FakeSettings.new("org.gnome.desktop.peripherals.keyboard")
+        )
+        module.Gio = FakeGio
+        try:
+            FakeSettings.repeat = True
+            FakeSettings.syncs = 0
+            self.engine.do_focus_in()
+            self.assertTrue(FakeSettings.repeat is False)
+            self.assertFalse(self.press(ord("a")))
+            self.assertTrue(FakeSettings.repeat is False)
+            self.assertEqual(0, FakeSettings.syncs)
+            self.assertFalse(self.release(ord("a")))
+            self.assertTrue(FakeSettings.repeat is False)
+            self.assertEqual(0, FakeSettings.syncs)
+        finally:
+            module.Gio = None
+            FakeSettings.repeat = True
+
+    def test_repeat_restore_respects_user_disabled_repeat(self):
+        class FakeSettings:
+            repeat = False
+
+            @classmethod
+            def new(cls, _schema):
+                return cls()
+
+            def get_boolean(self, _key):
+                return FakeSettings.repeat
+
+            def set_boolean(self, _key, value):
+                FakeSettings.repeat = value
+
+        class FakeGio:
+            Settings = FakeSettings
+
+        self.engine._keyboard_settings = staticmethod(
+            lambda: FakeSettings.new("org.gnome.desktop.peripherals.keyboard")
+        )
+        module.Gio = FakeGio
+        try:
+            self.assertFalse(self.press(ord("a")))
+            self.assertFalse(self.release(ord("a")))
+            self.assertTrue(FakeSettings.repeat is False)
+        finally:
+            module.Gio = None
+
+    def test_accentable_keys_never_engine_repeat(self):
+        self.assertFalse(self.press(ord("a")))
+        self.assertEqual(0, self.engine.keyrepeat_timer_id)
+        self.engine.open_popup()
+        self.assertEqual(0, self.engine.keyrepeat_timer_id)
+        self.assertFalse(self.release(ord("a")))
+
+    def test_plain_key_engine_repeats_while_held(self):
+        self.assertFalse(self.press(ord("b")))
+        timer = self.engine.keyrepeat_timer_id
+        self.assertNotEqual(0, timer)
+        FakeGLib.fire(timer)
+        self.assertEqual([(ord("b"), 38, 0)], self.engine.forwards)
+        # Rearmed for the next interval.
+        self.assertNotEqual(0, self.engine.keyrepeat_timer_id)
+        self.assertFalse(self.release(ord("b")))
+        self.assertEqual(0, self.engine.keyrepeat_timer_id)
+
+    def test_shortcuts_and_modifiers_do_not_repeat(self):
+        self.assertFalse(self.press(ord("c"), ModifierType.CONTROL_MASK))
+        self.assertEqual(0, self.engine.keyrepeat_timer_id)
+        self.assertFalse(self.press(FakeIBus.KEY_Shift_L))
+        self.assertEqual(0, self.engine.keyrepeat_timer_id)
+        self.assertFalse(self.release(FakeIBus.KEY_Shift_L))
+
+    def test_new_press_takes_over_repeat(self):
+        self.assertFalse(self.press(ord("b")))
+        first = self.engine.keyrepeat_timer_id
+        self.assertNotEqual(0, first)
+        self.assertFalse(self.press(ord("x")))
+        self.assertNotIn(first, FakeGLib.pending)
+        self.assertNotEqual(0, self.engine.keyrepeat_timer_id)
+        self.assertFalse(self.release(ord("x")))
+        self.assertEqual(0, self.engine.keyrepeat_timer_id)
 
 
 if __name__ == "__main__":

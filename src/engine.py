@@ -8,10 +8,29 @@ import gi
 gi.require_version("IBus", "1.0")
 from gi.repository import GLib, IBus
 
+try:
+    from gi.repository import Gio
+except Exception:  # pragma: no cover - headless test stubs
+    Gio = None
+
 BUS_NAME = "org.gnome.AccentHold"
 ENGINE_NAME = "accent-hold"
 HOLD_MS = 400
 LOG_PATH = os.environ.get("ACCENT_HOLD_LOG", "/tmp/accent-hold.log")
+# evdev KEY_BACKSPACE, the hardware keycode on any standard PC keyboard.
+# Forwarded BackSpace events must carry a real keycode: keycode 0 is
+# silently ignored by Wayland clients.
+BACKSPACE_KEYCODE_DEFAULT = 14
+# Delay between the forwarded BackSpace and the replacement commit. The
+# BackSpace round-trips through the client (in a terminal: app -> pty ->
+# shell -> redraw) while commit_text lands immediately; committing too early
+# lets the BackSpace eat the fresh accent ("a" instead of "à", randomly).
+COMMIT_DELAY_MS = 120
+# Fallback key-repeat timing (used when the desktop settings are
+# unreadable). Normally read from org.gnome.desktop.peripherals.keyboard
+# (delay / repeat-interval).
+KEY_REPEAT_DELAY_MS = 500
+KEY_REPEAT_INTERVAL_MS = 30
 
 ACCENTS = {
     "a": ["à", "á", "â", "ä", "ǎ", "æ", "ã", "å", "ā"],
@@ -54,6 +73,14 @@ class AccentHoldEngine(IBus.Engine):
     side effects on Wayland). Choosing a candidate deletes the natively
     inserted plain character (surrounding-text deletion or a forwarded
     BackSpace fallback) and commits the replacement.
+
+    Key repeat: on Wayland, autorepeat events reach the client even when the
+    engine consumes them, so a held key would always leak extra characters
+    ("aa" + menu). Like macOS press-and-hold, the engine therefore keeps the
+    compositor key repeat switched off for its whole lifetime and
+    reimplements repeat itself, but ONLY for non-accentable keys
+    (BackSpace, arrows, plain consonants, ...). A held accentable letter
+    produces exactly one character plus the picker — never repeats.
     """
 
     def __init__(self, connection, object_path):
@@ -92,6 +119,26 @@ class AccentHoldEngine(IBus.Engine):
         # IBus panel, not by the client toolkit.
         self.capabilities = 0
         self.caps_known = False
+        # Last hardware keycode observed for BackSpace (evdev 14 on PC
+        # keyboards); used so the replacement fallback forwards a usable
+        # key event instead of keycode 0, which Wayland clients ignore.
+        self.backspace_keycode = BACKSPACE_KEYCODE_DEFAULT
+        # Pending delayed replacement commit (BackSpace fallback path).
+        self.commit_timer_id = 0
+        # Compositor key repeat stays off while this engine lives (see
+        # class docstring); repeat for ordinary keys is reimplemented
+        # below with keyrepeat_timer_id.
+        self._repeat_suppressed = False
+        self._repeat_was_enabled = True
+        self._suppress_repeat()
+        # Engine-side repeat of the currently held non-accentable key.
+        self.keyrepeat_timer_id = 0
+        self.keyrepeat_key = None
+        # Autorepeat PRESS events observed (and swallowed) while the hold is
+        # armed or the popup is open. Kept as a safety net: with the
+        # compositor repeat off there should be none, but if any leak the
+        # replacement deletes 1 + repeat_extra chars.
+        self.repeat_extra = 0
         self._debug("ENGINE CREATED ui=ibus-lookup-table replacement=forward-first")
 
     def _debug(self, message):
@@ -151,7 +198,8 @@ class AccentHoldEngine(IBus.Engine):
             ("AUXILIARY_TEXT", 2),
             ("LOOKUP_TABLE", 4),
             ("FOCUS", 8),
-            ("SURROUNDING_TEXT", 16),
+            ("PROPERTY", 16),
+            ("SURROUNDING_TEXT", 32),
         ):
             try:
                 bit = int(getattr(cap_cls, attr, fallback))
@@ -178,6 +226,8 @@ class AccentHoldEngine(IBus.Engine):
 
     def do_focus_in(self):
         self._debug("FOCUS IN")
+        # Re-assert: the user may have toggled repeat manually meanwhile.
+        self._suppress_repeat()
 
     def do_focus_out(self):
         self._debug(
@@ -205,10 +255,133 @@ class AccentHoldEngine(IBus.Engine):
             GLib.source_remove(self.timer_id)
             self.timer_id = 0
 
+    @staticmethod
+    def _keyboard_settings():
+        if Gio is None:
+            return None
+        try:
+            return Gio.Settings.new("org.gnome.desktop.peripherals.keyboard")
+        except Exception:
+            return None
+
+    def _suppress_repeat(self):
+        # Persistent while the engine lives (macOS press-and-hold model):
+        # the compositor must never generate repeats, otherwise held keys
+        # leak extra characters past the engine. Async write (~0.1ms), and
+        # the user's original value is restored on destroy.
+        if self._repeat_suppressed:
+            return
+        settings = self._keyboard_settings()
+        if settings is None:
+            return
+        try:
+            self._repeat_was_enabled = bool(settings.get_boolean("repeat"))
+            if self._repeat_was_enabled:
+                settings.set_boolean("repeat", False)
+                self._debug("REPEAT SUPPRESSED via gsettings (async)")
+            self._repeat_suppressed = True
+        except Exception as exc:
+            self._debug(f"REPEAT SUPPRESS ERROR {exc!r}")
+
+    def _restore_repeat(self):
+        # Only on engine teardown; never during typing.
+        if not self._repeat_suppressed:
+            return
+        self._repeat_suppressed = False
+        if not self._repeat_was_enabled:
+            return
+        settings = self._keyboard_settings()
+        if settings is None:
+            return
+        try:
+            settings.set_boolean("repeat", True)
+            self._debug("REPEAT RESTORED via gsettings (async)")
+        except Exception as exc:
+            self._debug(f"REPEAT RESTORE ERROR {exc!r}")
+
+    def _key_repeat_timing(self):
+        delay, interval = KEY_REPEAT_DELAY_MS, KEY_REPEAT_INTERVAL_MS
+        settings = self._keyboard_settings()
+        if settings is not None:
+            try:
+                delay = int(settings.get_uint("delay"))
+            except Exception:
+                pass
+            try:
+                interval = int(settings.get_uint("repeat-interval"))
+            except Exception:
+                pass
+        delay = max(50, delay)
+        interval = max(1, min(interval, delay))
+        return delay, interval
+
+    @staticmethod
+    def _is_repeatable(keyval):
+        for attr in (
+            "KEY_Shift_L", "KEY_Shift_R",
+            "KEY_Control_L", "KEY_Control_R",
+            "KEY_Alt_L", "KEY_Alt_R",
+            "KEY_Super_L", "KEY_Super_R",
+            "KEY_Caps_Lock", "KEY_Num_Lock", "KEY_Scroll_Lock",
+            "KEY_ISO_Level3_Shift", "KEY_ISO_Level5_Shift",
+            "KEY_Mode_switch", "KEY_Multi_key",
+        ):
+            try:
+                candidate = getattr(IBus, attr, None)
+            except Exception:
+                candidate = None
+            if candidate is not None and keyval == candidate:
+                return False
+        return True
+
+    def _start_key_repeat(self, keyval, keycode, state):
+        self._cancel_key_repeat()
+        if not self._is_repeatable(keyval):
+            return
+        try:
+            press_state = int(state) & ~int(
+                IBus.ModifierType.RELEASE_MASK
+            )
+        except Exception:
+            press_state = 0
+        self.keyrepeat_key = (keyval, keycode, press_state)
+        delay, _interval = self._key_repeat_timing()
+        self._debug(f"KEYREPEAT ARM keyval={keyval} in {delay}ms")
+        self.keyrepeat_timer_id = GLib.timeout_add(
+            delay, self._on_key_repeat_fire
+        )
+
+    def _cancel_key_repeat(self):
+        if self.keyrepeat_timer_id:
+            try:
+                GLib.source_remove(self.keyrepeat_timer_id)
+            except Exception:
+                pass
+            self.keyrepeat_timer_id = 0
+        self.keyrepeat_key = None
+
+    def _on_key_repeat_fire(self):
+        if self.keyrepeat_key is None:
+            self.keyrepeat_timer_id = 0
+            return GLib.SOURCE_REMOVE
+        keyval, keycode, press_state = self.keyrepeat_key
+        self._debug(f"KEYREPEAT FIRE keyval={keyval}")
+        try:
+            self.forward_key_event(keyval, keycode, press_state)
+        except Exception as exc:
+            self._debug(f"KEYREPEAT FORWARD ERROR {exc!r}")
+        _delay, interval = self._key_repeat_timing()
+        self.keyrepeat_timer_id = GLib.timeout_add(
+            interval, self._on_key_repeat_fire
+        )
+        return GLib.SOURCE_REMOVE
+
     def _clear_state(self):
         self.cancel_timer()
+        self._cancel_key_repeat()
         self.pending_char = None
         self.pending_keyval = None
+        self.repeat_extra = 0
         self.candidates = []
         self.selected = 0
 
@@ -224,20 +397,47 @@ class AccentHoldEngine(IBus.Engine):
 
     def cancel_all(self):
         self.close_popup()
+        self._cancel_commit()
         self._clear_state()
+
+    def _cancel_commit(self):
+        if self.commit_timer_id:
+            try:
+                GLib.source_remove(self.commit_timer_id)
+            except Exception:
+                pass
+            self.commit_timer_id = 0
+
+    def _schedule_commit(self, text, extra_delay_ms=0):
+        self._cancel_commit()
+
+        def _do_commit():
+            self.commit_timer_id = 0
+            self._debug(f"REPLACE COMMIT commit({text!r})")
+            self._commit(text)
+            return GLib.SOURCE_REMOVE
+
+        delay = COMMIT_DELAY_MS + extra_delay_ms
+        self.commit_timer_id = GLib.timeout_add(delay, _do_commit)
+        self._debug(
+            f"REPLACE SCHEDULED commit({text!r}) in {delay}ms "
+            f"id={self.commit_timer_id}"
+        )
 
     def _commit(self, text):
         self.commit_text(IBus.Text.new_from_string(text))
 
-    def replace_immediate_char(self, replacement):
+    def replace_immediate_char(self, replacement, count=1):
         # The plain character was inserted natively by the application (the
-        # engine forwarded the original PRESS). Replace it in place: prefer
-        # surrounding-text deletion when the client exposes useful
-        # surrounding text, else fall back to a synthetic BackSpace forwarded
-        # through IBus (covers terminals and other clients without
-        # surrounding-text support). Focus stays in the application because
-        # the candidate UI is the native IBus panel, so both paths act on the
-        # correct input context.
+        # engine forwarded the original PRESS). Replace it in place.
+        # delete_surrounding_text() is only attempted when a surrounding
+        # query actually returned usable text: several clients advertise
+        # SURROUNDING_TEXT yet ignore the deletion (observed: query returns
+        # empty, delete is a no-op, commit appends -> "aà"). The synthetic
+        # BackSpace fallback works wherever a physical BackSpace works, so
+        # it is the default whenever the buffer contents are unconfirmed.
+        # Focus stays in the application because the candidate UI is the
+        # native IBus panel, so both paths act on the correct context.
         self._debug(f"REPLACE BEGIN replacement={replacement!r}")
 
         surrounding_value = ""
@@ -267,10 +467,15 @@ class AccentHoldEngine(IBus.Engine):
                 f"cursor={surrounding_cursor} anchor={self.surrounding_anchor}"
             )
 
-        if have_surrounding and surrounding_value and surrounding_cursor > 0:
-            self._debug("REPLACE ACTION delete_surrounding_text(-1, 1)")
+        query_usable = bool(
+            have_surrounding and surrounding_value and surrounding_cursor > 0
+        )
+        if query_usable:
+            # Never delete past the start of the reported buffer.
+            count = max(1, min(count, surrounding_cursor))
+            self._debug(f"REPLACE ACTION delete_surrounding_text({-count}, {count})")
             try:
-                self.delete_surrounding_text(-1, 1)
+                self.delete_surrounding_text(-count, count)
             except Exception as exc:
                 self._debug(f"DELETE ERROR {exc!r}")
             self._debug(f"REPLACE ACTION commit({replacement!r})")
@@ -278,18 +483,21 @@ class AccentHoldEngine(IBus.Engine):
             self._debug("REPLACE END via surrounding-text")
             return
 
-        self._debug("REPLACE ACTION fallback BackSpace")
-        # keycode 0 lets the client interpret the event via keyval; a
-        # hardcoded X11 keycode is not valid on Wayland.
-        self.forward_key_event(IBus.KEY_BackSpace, 0, 0)
-        self.forward_key_event(
-            IBus.KEY_BackSpace,
-            0,
-            IBus.ModifierType.RELEASE_MASK,
+        self._debug(
+            f"REPLACE ACTION fallback {count}x BackSpace "
+            f"keycode={self.backspace_keycode}"
         )
-        self._debug(f"REPLACE ACTION commit({replacement!r})")
-        self._commit(replacement)
-        self._debug("REPLACE END via BackSpace")
+        for _ in range(count):
+            self.forward_key_event(IBus.KEY_BackSpace, self.backspace_keycode, 0)
+            self.forward_key_event(
+                IBus.KEY_BackSpace,
+                self.backspace_keycode,
+                IBus.ModifierType.RELEASE_MASK,
+            )
+        # Commit is delayed so the client processes the BackSpaces first;
+        # see COMMIT_DELAY_MS, plus a bit more per extra deleted char.
+        self._schedule_commit(replacement, 50 * (count - 1))
+        self._debug("REPLACE END via BackSpace (commit scheduled)")
 
     def _build_lookup_table(self):
         table = IBus.LookupTable.new(len(self.candidates), 0, True, True)
@@ -327,11 +535,14 @@ class AccentHoldEngine(IBus.Engine):
             self._debug("CHOOSE IGNORED invalid state/index")
             return
         replacement = self.candidates[index]
+        # Capture how many plain chars the client inserted (initial forward
+        # plus leaked repeats) before the state is cleared.
+        count = 1 + self.repeat_extra
         # Hide the panel first so no stale candidates remain visible while
         # the replacement is delivered to the application.
         self.close_popup()
         self._clear_state()
-        self.replace_immediate_char(replacement)
+        self.replace_immediate_char(replacement, count)
 
     def do_candidate_clicked(self, index, button, state):
         self._debug(
@@ -430,6 +641,7 @@ class AccentHoldEngine(IBus.Engine):
                     )
                     return False
                 self._debug(f"REPEAT SWALLOWED keyval={keyval}")
+                self.repeat_extra += 1
                 return True
             if release:
                 # Swallow releases of keys consumed on PRESS; pass through
@@ -462,12 +674,13 @@ class AccentHoldEngine(IBus.Engine):
                 self.close_popup()
                 self._clear_state()
                 return True
-            # Any other key keeps the original letter and closes the popup;
-            # return False so the key itself inserts normally.
+            # Any other key keeps the original letter and closes the popup,
+            # then behaves like a fresh press (hold detection for
+            # accentable keys, engine repeat otherwise).
             self._debug("OTHER KEY keep original, pass through")
             self.close_popup()
             self._clear_state()
-            return False
+            return self._handle_fresh_press(keyval, keycode, state)
 
         if release:
             if self.pending_keyval is not None and keyval == self.pending_keyval:
@@ -479,14 +692,24 @@ class AccentHoldEngine(IBus.Engine):
                 )
                 self._clear_state()
                 return False
+            self._cancel_key_repeat()
             return False
 
+        return self._handle_fresh_press(keyval, keycode, state)
+
+    def _handle_fresh_press(self, keyval, keycode, state):
+        self._cancel_key_repeat()
         char = IBus.keyval_to_unicode(keyval) or ""
         if isinstance(char, int):
             char = chr(char) if char else ""
+        if keyval == IBus.KEY_BackSpace:
+            # Remember the real hardware keycode so the replacement
+            # fallback can forward a BackSpace the client honors.
+            self.backspace_keycode = keycode
         if char in ACCENTS:
             if self.pending_keyval == keyval:
                 self._debug(f"PENDING REPEAT SWALLOWED keyval={keyval}")
+                self.repeat_extra += 1
                 return True
             if self.pending_char is not None:
                 # A previous pending hold never resolved; its character was
@@ -496,7 +719,10 @@ class AccentHoldEngine(IBus.Engine):
             # character natively right now (zero latency, works even where
             # commit_text would never land, e.g. browser-based consoles).
             # The engine only arms hold detection; replacement happens later
-            # via delete_surrounding_text/BackSpace + commit.
+            # via delete_surrounding_text/BackSpace + commit. Accentable
+            # keys never engine-repeat: hold shows the picker instead.
+            # (Compositor repeat is off engine-wide, so exactly one char
+            # lands.)
             self.pending_char = char
             self.pending_keyval = keyval
             self.timer_id = GLib.timeout_add(HOLD_MS, self.open_popup)
@@ -508,10 +734,19 @@ class AccentHoldEngine(IBus.Engine):
             return False
         if self.pending_char is not None:
             self._clear_state()
+        # Ordinary key: the client inserts it natively (return False) and
+        # the engine repeats it while held (compositor repeat is off).
+        self._start_key_repeat(keyval, keycode, state)
         return False
 
     def do_destroy(self):
         self.cancel_all()
+        self._restore_repeat()
+        if Gio is not None:
+            try:
+                Gio.Settings.sync()
+            except Exception:
+                pass
         super().do_destroy()
 
 

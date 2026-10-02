@@ -55,6 +55,9 @@ It is particularly useful if you normally type with a US keyboard but regularly 
 
 - Immediate normal typing with a US keyboard layout
 - Press-and-hold character picker
+- Held letters never repeat into `aaaa`: exactly one character plus the menu
+- Key repeat kept working for ordinary keys (BackSpace, arrows, consonants
+  without variants, ...), using the desktop delay/interval settings
 - Number shortcuts displayed below each candidate
 - Arrow-key navigation
 - Enter to select
